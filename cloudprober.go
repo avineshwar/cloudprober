@@ -23,14 +23,18 @@ package cloudprober
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/golang/protobuf/proto"
+	"github.com/google/cloudprober/common/tlsconfig"
 	"github.com/google/cloudprober/config"
 	configpb "github.com/google/cloudprober/config/proto"
 	"github.com/google/cloudprober/config/runconfig"
@@ -79,6 +83,22 @@ func getServerHost(c *configpb.ProberConfig) string {
 	return serverHost
 }
 
+func parsePort(portStr string) (int64, error) {
+	if strings.HasPrefix(portStr, "tcp://") {
+		u, err := url.Parse(portStr)
+		if err != nil {
+			return 0, err
+		}
+		if u.Port() == "" {
+			return 0, fmt.Errorf("no port specified in URL %s", portStr)
+		}
+		// u.Port() returns port as a string, thus it
+		// will be converted to int64 at the end.
+		portStr = u.Port()
+	}
+	return strconv.ParseInt(portStr, 10, 32)
+}
+
 func initDefaultServer(c *configpb.ProberConfig) (net.Listener, error) {
 	serverHost := getServerHost(c)
 	serverPort := int(c.GetPort())
@@ -88,7 +108,7 @@ func initDefaultServer(c *configpb.ProberConfig) (net.Listener, error) {
 		// If ServerPortEnvVar is defined, it will override the default
 		// server port.
 		if portStr := os.Getenv(ServerPortEnvVar); portStr != "" {
-			port, err := strconv.ParseInt(portStr, 10, 32)
+			port, err := parsePort(portStr)
 			if err != nil {
 				return nil, fmt.Errorf("failed to parse default port from the env var: %s=%s", ServerPortEnvVar, portStr)
 			}
@@ -156,12 +176,12 @@ func InitFromConfig(configFile string) error {
 		// their services with it in the prober.Init() phase.
 		var serverOpts []grpc.ServerOption
 
-		if cfg.GetGrpcTlsCertFile() != "" {
-			creds, err := credentials.NewServerTLSFromFile(cfg.GetGrpcTlsCertFile(), cfg.GetGrpcTlsKeyFile())
-			if err != nil {
-				return fmt.Errorf("error initializing gRPC server TLS credentials: %v", err)
+		if cfg.GetGrpcTlsConfig() != nil {
+			tlsConfig := &tls.Config{}
+			if err := tlsconfig.UpdateTLSConfig(tlsConfig, cfg.GetGrpcTlsConfig(), true); err != nil {
+				return err
 			}
-			serverOpts = append(serverOpts, grpc.Creds(creds))
+			serverOpts = append(serverOpts, grpc.Creds(credentials.NewTLS(tlsConfig)))
 		}
 
 		runconfig.SetDefaultGRPCServer(grpc.NewServer(serverOpts...))

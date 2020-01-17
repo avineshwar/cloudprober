@@ -28,12 +28,15 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/cloudprober/common/oauth"
+	"github.com/google/cloudprober/common/tlsconfig"
 	"github.com/google/cloudprober/logger"
 	"github.com/google/cloudprober/metrics"
 	configpb "github.com/google/cloudprober/probes/http/proto"
 	"github.com/google/cloudprober/probes/options"
 	"github.com/google/cloudprober/targets/endpoint"
 	"github.com/google/cloudprober/validators"
+	"golang.org/x/oauth2"
 )
 
 const (
@@ -52,10 +55,12 @@ type Probe struct {
 	// book-keeping params
 	targets      []endpoint.Endpoint
 	httpRequests map[string]*http.Request
-	results      map[string]*result
+	results      map[string]*probeResult
 	protocol     string
 	method       string
 	url          string
+	oauthTS      oauth2.TokenSource
+	bearerToken  string
 
 	// Run counter, used to decide when to update targets or export
 	// stats.
@@ -72,7 +77,7 @@ type Probe struct {
 	statsExportFrequency int64
 }
 
-type result struct {
+type probeResult struct {
 	total, success, timeouts int64
 	latency                  metrics.Value
 	respCodes                *metrics.Map
@@ -101,10 +106,6 @@ func (p *Probe) Init(name string, opts *options.Options) error {
 		return fmt.Errorf("Invalid Relative URL: %s, must begin with '/'", p.url)
 	}
 
-	if p.c.GetRequestsPerProbe() != 1 {
-		p.l.Warningf("requests_per_probe field is now deprecated and will be removed in future releases.")
-	}
-
 	// Create a transport for our use. This is mostly based on
 	// http.DefaultTransport with some timeouts changed.
 	// TODO(manugarg): Considering cloning DefaultTransport once
@@ -112,7 +113,6 @@ func (p *Probe) Init(name string, opts *options.Options) error {
 	dialer := &net.Dialer{
 		Timeout:   p.opts.Timeout,
 		KeepAlive: 30 * time.Second, // TCP keep-alive
-		DualStack: true,
 	}
 
 	if p.opts.SourceIP != nil {
@@ -128,8 +128,21 @@ func (p *Probe) Init(name string, opts *options.Options) error {
 		TLSHandshakeTimeout: p.opts.Timeout,
 	}
 
-	if p.c.GetDisableCertValidation() {
-		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	if p.c.GetDisableCertValidation() || p.c.GetTlsConfig() != nil {
+		if transport.TLSClientConfig == nil {
+			transport.TLSClientConfig = &tls.Config{}
+		}
+
+		if p.c.GetDisableCertValidation() {
+			p.l.Warning("disable_cert_validation is deprecated as of v0.10.6. Instead of this, please use \"tls_config {disable_cert_validation: true}\"")
+			transport.TLSClientConfig.InsecureSkipVerify = true
+		}
+
+		if p.c.GetTlsConfig() != nil {
+			if err := tlsconfig.UpdateTLSConfig(transport.TLSClientConfig, p.c.GetTlsConfig(), false); err != nil {
+				return err
+			}
+		}
 	}
 
 	// If HTTP keep-alives are not enabled (default), disable HTTP keep-alive in
@@ -139,6 +152,14 @@ func (p *Probe) Init(name string, opts *options.Options) error {
 	} else {
 		// If it's been more than 2 probe intervals since connection was used, close it.
 		transport.IdleConnTimeout = 2 * p.opts.Interval
+	}
+
+	if p.c.GetOauthConfig() != nil {
+		oauthTS, err := oauth.TokenSourceFromConfig(p.c.GetOauthConfig(), p.l)
+		if err != nil {
+			return err
+		}
+		p.oauthTS = oauthTS
 	}
 
 	if p.c.GetDisableHttp2() {
@@ -182,12 +203,17 @@ func isClientTimeout(err error) bool {
 }
 
 // httpRequest executes an HTTP request and updates the provided result struct.
-func (p *Probe) doHTTPRequest(req *http.Request, result *result) {
+func (p *Probe) doHTTPRequest(req *http.Request, result *probeResult, resultMu *sync.Mutex) {
 	start := time.Now()
-	result.total++
 
 	resp, err := p.client.Do(req)
 	latency := time.Since(start)
+
+	// Note that we take lock on result object outside of the actual request.
+	resultMu.Lock()
+	defer resultMu.Unlock()
+
+	result.total++
 
 	if err != nil {
 		if isClientTimeout(err) {
@@ -205,12 +231,14 @@ func (p *Probe) doHTTPRequest(req *http.Request, result *result) {
 		return
 	}
 
+	p.l.Debug("Target:", req.Host, ", URL:", req.URL.String(), ", response: ", string(respBody))
+
 	// Calling Body.Close() allows the TCP connection to be reused.
 	resp.Body.Close()
 	result.respCodes.IncKey(strconv.FormatInt(int64(resp.StatusCode), 10))
 
 	if p.opts.Validators != nil {
-		failedValidations := validators.RunValidators(p.opts.Validators, resp, respBody, result.validationFailure, p.l)
+		failedValidations := validators.RunValidators(p.opts.Validators, &validators.Input{Response: resp, ResponseBody: respBody}, result.validationFailure, p.l)
 
 		// If any validation failed, return now, leaving the success and latency
 		// counters unchanged.
@@ -237,12 +265,23 @@ func (p *Probe) updateTargets() {
 	}
 
 	if p.results == nil {
-		p.results = make(map[string]*result, len(p.targets))
+		p.results = make(map[string]*probeResult, len(p.targets))
+	}
+
+	// OAuth token is target independent.
+	if p.oauthTS != nil {
+		tok, err := p.oauthTS.Token()
+		if err != nil {
+			p.l.Error("Error getting OAuth token: ", err.Error(), ". Skipping updating the token.")
+		} else {
+			p.l.Debug("Got OAuth token, len: ", strconv.FormatInt(int64(len(tok.AccessToken)), 10), ", expirationTime: ", tok.Expiry.String())
+			p.bearerToken = tok.AccessToken
+		}
 	}
 
 	for _, target := range p.targets {
 		// Update HTTP request
-		req := p.httpRequestForTarget(target.Name)
+		req := p.httpRequestForTarget(target)
 		if req != nil {
 			p.httpRequests[target.Name] = req
 		}
@@ -259,7 +298,7 @@ func (p *Probe) updateTargets() {
 			} else {
 				latencyValue = metrics.NewFloat(0)
 			}
-			p.results[target.Name] = &result{
+			p.results[target.Name] = &probeResult{
 				latency:           latencyValue,
 				respCodes:         metrics.NewMap("code", metrics.NewInt(0)),
 				respBodies:        metrics.NewMap("resp", metrics.NewInt(0)),
@@ -275,28 +314,26 @@ func (p *Probe) runProbe(ctx context.Context) {
 
 	wg := sync.WaitGroup{}
 	for _, target := range p.targets {
-		req := p.httpRequests[target.Name]
+		req, result := p.httpRequests[target.Name], p.results[target.Name]
 		if req == nil {
 			continue
 		}
 
-		wg.Add(1)
+		// We launch a separate goroutine for each HTTP request. Since there can be
+		// multiple requests per probe per target, we use a mutex to protect access
+		// to per-target result object in doHTTPRequest. Note that result object is
+		// not accessed concurrently anywhere else -- export of the metrics happens
+		// when probe is not running.
+		var resultMu sync.Mutex
 
-		// Launch a separate goroutine for each target.
-		go func(target string, req *http.Request) {
-			defer wg.Done()
-			numRequests := int32(0)
-			for {
-				p.doHTTPRequest(req.WithContext(reqCtx), p.results[target])
+		for numReq := int32(0); numReq < p.c.GetRequestsPerProbe(); numReq++ {
+			wg.Add(1)
 
-				numRequests++
-				if numRequests >= p.c.GetRequestsPerProbe() {
-					break
-				}
-				// Sleep for requests_interval_msec before continuing.
-				time.Sleep(time.Duration(p.c.GetRequestsIntervalMsec()) * time.Millisecond)
-			}
-		}(target.Name, req)
+			go func(req *http.Request, result *probeResult) {
+				defer wg.Done()
+				p.doHTTPRequest(req.WithContext(reqCtx), result, &resultMu)
+			}(req, result)
+		}
 	}
 
 	// Wait until all probes are done.

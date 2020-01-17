@@ -21,9 +21,9 @@ import (
 
 	"github.com/golang/protobuf/proto"
 	"github.com/google/cloudprober/logger"
+	"github.com/google/cloudprober/probes/common/statskeeper"
 	configpb "github.com/google/cloudprober/probes/dns/proto"
 	"github.com/google/cloudprober/probes/options"
-	"github.com/google/cloudprober/probes/probeutils"
 	"github.com/google/cloudprober/targets"
 	"github.com/google/cloudprober/validators"
 	validatorpb "github.com/google/cloudprober/validators/proto"
@@ -69,9 +69,9 @@ func (*mockClient) setSourceIP(net.IP)           {}
 
 func runProbe(t *testing.T, testName string, p *Probe, total, success int64) {
 	p.client = new(mockClient)
-	p.targets = p.opts.Targets.List()
+	p.targets = p.opts.Targets.ListEndpoints()
 
-	resultsChan := make(chan probeutils.ProbeResult, len(p.targets))
+	resultsChan := make(chan statskeeper.ProbeResult, len(p.targets))
 	p.runProbe(resultsChan)
 
 	// The resultsChan output iterates through p.targets in the same order.
@@ -82,9 +82,9 @@ func runProbe(t *testing.T, testName string, p *Probe, total, success int64) {
 			t.Errorf("test(%s): result mismatch got (total, success) = (%d, %d), want (%d, %d)",
 				testName, result.total.Int64(), result.success.Int64(), total, success)
 		}
-		if result.Target() != target {
+		if result.Target() != target.Name {
 			t.Errorf("test(%s): unexpected target in probe result. got: %s, want: %s",
-				testName, result.Target(), target)
+				testName, result.Target(), target.Name)
 		}
 	}
 }

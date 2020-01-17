@@ -2,7 +2,10 @@ syntax = "proto2";
 
 package cloudprober.probes.http;
 
-// Next tag: 15
+import "github.com/google/cloudprober/common/oauth/proto/config.proto";
+import "github.com/google/cloudprober/common/tlsconfig/proto/config.proto";
+
+// Next tag: 16
 message ProbeConf {
   enum ProtocolType {
     HTTP = 0;
@@ -28,7 +31,11 @@ message ProbeConf {
   optional ProtocolType protocol = 1 [default = HTTP];
   // Relative URL (to append to all targets). Must begin with '/'
   optional string relative_url = 2;
-  // Port, default is 80 for HTTP and 443 for HTTPS
+  // Port for HTTP requests. If not specfied, port is selected in the following
+  // order:
+  //  - If port is provided by the targets (e.g. kubernetes endpoint or
+  //    service), that port is used.
+  //  - 80 for HTTP and 443 for HTTPS.
   optional int32 port = 3;
 
   // Whether to resolve the target before making the request. If set to false,
@@ -51,7 +58,10 @@ message ProbeConf {
 
   // Enable HTTP keep-alive. If set to true, underlying connection is reused
   // for further probes. Default is to close the connection after every request.
-  optional bool keep_alive = 12;
+  optional bool keep_alive = 10;
+
+  // OAuth Config
+  optional oauth.Config oauth_config = 11;
 
   // Disable HTTP2
   // Golang HTTP client automatically enables HTTP/2 if server supports it. This
@@ -59,13 +69,23 @@ message ProbeConf {
   optional bool disable_http2 = 13;
 
   // Disable TLS certificate validation. If set to true, any certificate
-  // presented by the server for any host name will be accepted.
+  // presented by the server for any host name will be accepted
+  // Deprecation: This option is now subsumed by the tls_config below. To
+  // disable cert validation use:
+  // tls_config {
+  //   disable_cert_validation: true
+  // }
   optional bool disable_cert_validation = 14;
 
-  // Requests per probe (Deprecated).
-  // NOTE: This field is now deprecated and will be removed after the v0.10.3
-  // releases.
+  // TLS config
+  optional tlsconfig.TLSConfig tls_config = 15;
+
+  // Requests per probe.
+  // Number of HTTP requests per probe. Requests are executed concurrently and
+  // each HTTP re contributes to probe results. For example, if you run two
+  // requests per probe, "total" counter will be incremented by 2.
   optional int32 requests_per_probe = 98 [default = 1];
+
   // How long to wait between two requests to the same target
   // NOTE: This field is now deprecated and will be removed after the v0.10.3
   // releases.

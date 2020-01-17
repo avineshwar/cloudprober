@@ -34,9 +34,10 @@ import (
 
 	"github.com/google/cloudprober/logger"
 	"github.com/google/cloudprober/metrics"
+	"github.com/google/cloudprober/probes/common/statskeeper"
 	configpb "github.com/google/cloudprober/probes/dns/proto"
 	"github.com/google/cloudprober/probes/options"
-	"github.com/google/cloudprober/probes/probeutils"
+	"github.com/google/cloudprober/targets/endpoint"
 	"github.com/google/cloudprober/validators"
 	"github.com/miekg/dns"
 )
@@ -74,7 +75,7 @@ type Probe struct {
 	l    *logger.Logger
 
 	// book-keeping params
-	targets []string
+	targets []endpoint.Endpoint
 	msg     *dns.Msg
 	client  Client
 }
@@ -107,6 +108,16 @@ func (prr probeRunResult) Target() string {
 	return prr.target
 }
 
+func (p *Probe) updateTargets() {
+	p.targets = p.opts.Targets.ListEndpoints()
+
+	for _, target := range p.targets {
+		for _, al := range p.opts.AdditionalLabels {
+			al.UpdateForTarget(target.Name, target.Labels)
+		}
+	}
+}
+
 // Init initializes the probe with the given params.
 func (p *Probe) Init(name string, opts *options.Options) error {
 	c, ok := opts.ProbeConf.(*configpb.ProbeConf)
@@ -119,7 +130,7 @@ func (p *Probe) Init(name string, opts *options.Options) error {
 	if p.l = opts.Logger; p.l == nil {
 		p.l = &logger.Logger{}
 	}
-	p.targets = p.opts.Targets.List()
+	p.updateTargets()
 
 	// I believe these objects are safe for concurrent use by multiple goroutines
 	// (although the documentation doesn't explicitly say so). It uses locks
@@ -176,7 +187,7 @@ func (p *Probe) validateResponse(resp *dns.Msg, target string, result *probeRunR
 		}
 		respBytes := []byte(strings.Join(answers, "\n"))
 
-		failedValidations := validators.RunValidators(p.opts.Validators, nil, respBytes, result.validationFailure, p.l)
+		failedValidations := validators.RunValidators(p.opts.Validators, &validators.Input{ResponseBody: respBytes}, result.validationFailure, p.l)
 		if len(failedValidations) > 0 {
 			p.l.Debugf("Target(%s): validators %v failed. Resp: %v", target, failedValidations, answers)
 			return false
@@ -186,9 +197,9 @@ func (p *Probe) validateResponse(resp *dns.Msg, target string, result *probeRunR
 	return true
 }
 
-func (p *Probe) runProbe(resultsChan chan<- probeutils.ProbeResult) {
+func (p *Probe) runProbe(resultsChan chan<- statskeeper.ProbeResult) {
 	// Refresh the list of targets to probe.
-	p.targets = p.opts.Targets.List()
+	p.updateTargets()
 
 	wg := sync.WaitGroup{}
 	for _, target := range p.targets {
@@ -196,11 +207,11 @@ func (p *Probe) runProbe(resultsChan chan<- probeutils.ProbeResult) {
 
 		// Launch a separate goroutine for each target.
 		// Write probe results to the "resultsChan" channel.
-		go func(target string, resultsChan chan<- probeutils.ProbeResult) {
+		go func(target endpoint.Endpoint, resultsChan chan<- statskeeper.ProbeResult) {
 			defer wg.Done()
 
 			result := probeRunResult{
-				target:            target,
+				target:            target.Name,
 				validationFailure: validators.ValidationFailureMap(p.opts.Validators),
 			}
 
@@ -210,7 +221,7 @@ func (p *Probe) runProbe(resultsChan chan<- probeutils.ProbeResult) {
 				result.latency = metrics.NewFloat(0)
 			}
 
-			fullTarget := net.JoinHostPort(target, "53")
+			fullTarget := net.JoinHostPort(target.Name, "53")
 			result.total.Inc()
 			resp, latency, err := p.client.Exchange(p.msg, fullTarget)
 
@@ -235,15 +246,15 @@ func (p *Probe) runProbe(resultsChan chan<- probeutils.ProbeResult) {
 
 // Start starts and runs the probe indefinitely.
 func (p *Probe) Start(ctx context.Context, dataChan chan *metrics.EventMetrics) {
-	resultsChan := make(chan probeutils.ProbeResult, len(p.targets))
+	resultsChan := make(chan statskeeper.ProbeResult, len(p.targets))
 
 	// This function is used by StatsKeeper to get the latest list of targets.
 	// TODO(manugarg): Make p.targets mutex protected as it's read and written by concurrent goroutines.
-	targetsFunc := func() []string {
+	targetsFunc := func() []endpoint.Endpoint {
 		return p.targets
 	}
 
-	go probeutils.StatsKeeper(ctx, "dns", p.name, p.opts.StatsExportInterval, targetsFunc, resultsChan, dataChan, p.opts.LogMetrics, p.l)
+	go statskeeper.StatsKeeper(ctx, "dns", p.name, p.opts, targetsFunc, resultsChan, dataChan)
 
 	ticker := time.NewTicker(p.opts.Interval)
 	defer ticker.Stop()

@@ -34,9 +34,11 @@ import (
 	"github.com/google/cloudprober/message"
 	"github.com/google/cloudprober/metrics"
 	"github.com/google/cloudprober/probes/options"
+	"github.com/google/cloudprober/probes/probeutils"
 	configpb "github.com/google/cloudprober/probes/udp/proto"
 	udpsrv "github.com/google/cloudprober/servers/udp"
 	"github.com/google/cloudprober/sysvars"
+	"github.com/google/cloudprober/targets/endpoint"
 )
 
 const (
@@ -46,7 +48,8 @@ const (
 	// list under maxTargets.
 	// TODO(manugarg): Make it configurable with documentation on its implication
 	// on resource consumption.
-	maxTargets = 500
+	maxTargets     = 500
+	payloadPattern = "cloudprober"
 )
 
 // flow represents a UDP flow.
@@ -72,9 +75,10 @@ type Probe struct {
 	runID       uint64
 	ipVer       int
 
-	targets []string              // List of targets for a probe iteration.
+	targets []endpoint.Endpoint   // List of targets for a probe iteration.
 	res     map[flow]*probeResult // Results by flow.
 	fsm     *message.FlowStateMap // Map flow parameters to flow state.
+	payload []byte
 
 	// Intermediate buffers of sent and received packets
 	sentPackets, rcvdPackets chan packetID
@@ -92,7 +96,7 @@ type probeResult struct {
 }
 
 // Metrics converts probeResult into metrics.EventMetrics object
-func (prr probeResult) EventMetrics(probeName string, f flow, c *configpb.ProbeConf) *metrics.EventMetrics {
+func (prr probeResult) eventMetrics(probeName string, opts *options.Options, f flow, c *configpb.ProbeConf) *metrics.EventMetrics {
 	var suffix string
 	if c.GetExportMetricsByPort() {
 		suffix = "-per-port"
@@ -105,10 +109,16 @@ func (prr probeResult) EventMetrics(probeName string, f flow, c *configpb.ProbeC
 		AddLabel("ptype", "udp").
 		AddLabel("probe", probeName).
 		AddLabel("dst", f.target)
+
+	for _, al := range opts.AdditionalLabels {
+		m.AddLabel(al.KeyValueForTarget(f.target))
+	}
+
 	if c.GetExportMetricsByPort() {
 		m.AddLabel("src_port", f.srcPort).
 			AddLabel("dst_port", fmt.Sprintf("%d", c.GetPort()))
 	}
+
 	return m
 }
 
@@ -139,6 +149,11 @@ func (p *Probe) Init(name string, opts *options.Options) error {
 	p.c = c
 	p.fsm = message.NewFlowStateMap()
 	p.res = make(map[flow]*probeResult)
+
+	if p.c.GetPayloadSize() != 0 {
+		p.payload = make([]byte, p.c.GetPayloadSize())
+		probeutils.PatternPayload(p.payload, []byte(payloadPattern))
+	}
 
 	// Initialize intermediate buffers of sent and received packets
 	p.flushIntv = 2 * p.opts.Interval
@@ -198,7 +213,7 @@ func (p *Probe) Init(name string, opts *options.Options) error {
 func (p *Probe) initProbeRunResults() error {
 	for _, target := range p.targets {
 		if !p.c.GetExportMetricsByPort() {
-			f := flow{"", target}
+			f := flow{"", target.Name}
 			if p.res[f] == nil {
 				p.res[f] = p.newProbeResult()
 			}
@@ -206,7 +221,7 @@ func (p *Probe) initProbeRunResults() error {
 		}
 
 		for _, srcPort := range p.srcPortList {
-			f := flow{srcPort, target}
+			f := flow{srcPort, target.Name}
 			if p.res[f] == nil {
 				p.res[f] = p.newProbeResult()
 			}
@@ -364,7 +379,11 @@ func (p *Probe) runSingleProbe(f flow, conn *net.UDPConn, maxLen, dstPort int) e
 
 	flowState := p.fsm.FlowState(p.src, f.srcPort, f.target)
 	now := time.Now()
-	msg, seq, err := flowState.CreateMessage(now, maxLen)
+	msg, seq, err := flowState.CreateMessage(now, p.payload, maxLen)
+	if err != nil {
+		return fmt.Errorf("error creating new message to probe target(%s): %v", f.target, err)
+	}
+
 	if _, err := conn.WriteToUDP(msg, raddr); err != nil {
 		flowState.WithdrawMessage(seq)
 		return fmt.Errorf("unable to send to %s(%v): %v", f.target, raddr, err)
@@ -418,7 +437,7 @@ func (p *Probe) runProbe() {
 				if err := p.runSingleProbe(f, conn, maxLen, dstPort); err != nil {
 					p.l.Errorf("Probing %+v failed: %v", f, err)
 				}
-			}(conn, flow{p.srcPortList[connID], target})
+			}(conn, flow{p.srcPortList[connID], target.Name})
 		}
 	}
 	wg.Wait()
@@ -427,7 +446,7 @@ func (p *Probe) runProbe() {
 
 // Start starts and runs the probe indefinitely.
 func (p *Probe) Start(ctx context.Context, dataChan chan *metrics.EventMetrics) {
-	p.targets = p.opts.Targets.List()
+	p.targets = p.opts.Targets.ListEndpoints()
 	p.initProbeRunResults()
 
 	for _, conn := range p.connList {
@@ -451,12 +470,12 @@ func (p *Probe) Start(ctx context.Context, dataChan chan *metrics.EventMetrics) 
 			p.processPackets()
 		case <-statsExportTicker.C:
 			for f, result := range p.res {
-				em := result.EventMetrics(p.name, f, p.c)
+				em := result.eventMetrics(p.name, p.opts, f, p.c)
 				p.opts.LogMetrics(em)
 				dataChan <- em
 			}
 
-			p.targets = p.opts.Targets.List()
+			p.targets = p.opts.Targets.ListEndpoints()
 			if len(p.targets) > maxTargets {
 				p.l.Warningf("Number of targets (%d) > maxTargets (%d). Truncating the targets list.", len(p.targets), maxTargets)
 				p.targets = p.targets[:maxTargets]

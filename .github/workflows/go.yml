@@ -1,0 +1,107 @@
+name: Go Build and Test
+on: [push, pull_request]
+jobs:
+
+  build_ubuntu_windows:
+    name: Build and Test
+    env:
+      # UDP tests use this variable to disable IPv6.
+      TRAVIS: yes
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+
+    - name: Set up Go 1.13
+      uses: actions/setup-go@v1
+      with:
+        go-version: 1.13
+      id: go
+
+    - name: Check out code into the Go module directory
+      uses: actions/checkout@v1
+
+    - name: Get dependencies
+      run: |
+        go get -v -t -d ./...
+
+    - name: Build
+      run: go build -v .
+
+    - name: Test
+      run: go test -v -race -covermode=atomic ./...
+
+    - name: Build cloudprober Binary
+      run: make cloudprober
+      
+    - name: Upload cloudprober binary
+      uses: actions/upload-artifact@v1
+      with:
+        name: cloudprober-binary-${{ matrix.os }}
+        path: cloudprober
+
+  build_macos:
+    name: Build and Test on MacOS
+    env:
+      # Disable UDP tests on MacOS. They are flaky.
+      EXTRA_TEST_FLAGS: -tags skip_udp_probe_test
+    runs-on: macOS-latest
+    steps:
+
+    - name: Set up Go 1.13
+      uses: actions/setup-go@v1
+      with:
+        go-version: 1.13
+      id: go
+
+    - name: Check out code into the Go module directory
+      uses: actions/checkout@v1
+
+    - name: Get dependencies
+      run: |
+        go get -v -t -d ./...
+
+    - name: Build
+      run: go build -v .
+
+    - name: Test
+      run: go test ${EXTRA_TEST_FLAGS} -v -race -covermode=atomic ./...
+
+    - name: Build cloudprober Binary
+      run: make cloudprober
+      
+    - name: Upload cloudprober binary
+      uses: actions/upload-artifact@v1
+      with:
+        name: cloudprober-binary-macos
+        path: cloudprober
+      
+  build_and_push_docker:
+    name: Build and push docker image
+    needs: [build_ubuntu_windows, build_macos]
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Check out code into the Go module directory
+      uses: actions/checkout@v1
+
+    - name: Download cloudprober binary
+      uses: actions/download-artifact@v1
+      with:
+        name: cloudprober-binary-ubuntu-latest
+        key: cloudprober  
+        
+    - name: Build Docker Image
+      env: 
+        DOCKER_IMAGE: cloudprober/cloudprober-test  
+      run: |
+        mv cloudprober-binary-ubuntu-latest cloudprober
+        make docker_build
+
+    - name: Push Docker Image
+      env: 
+        DOCKER_IMAGE: cloudprober/cloudprober-test  
+        DOCKER_USER: ${{ secrets.docker_login }}
+        DOCKER_PASS: ${{ secrets.docker_pass }}
+      run: make docker_push

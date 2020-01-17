@@ -27,8 +27,8 @@ import (
 	"github.com/google/cloudprober/logger"
 	"github.com/google/cloudprober/message"
 	"github.com/google/cloudprober/metrics"
+	"github.com/google/cloudprober/probes/common/statskeeper"
 	"github.com/google/cloudprober/probes/options"
-	"github.com/google/cloudprober/probes/probeutils"
 	"github.com/google/cloudprober/sysvars"
 	"github.com/google/cloudprober/targets"
 
@@ -118,7 +118,7 @@ func sendPktsAndCollectReplies(ctx context.Context, t *testing.T, srvPort int, i
 			time.Sleep(interval * time.Duration(seq-prevSeq))
 		}
 		fs.SetSeq(uint64(seq))
-		buf, _, err := fs.CreateMessage(time.Now(), maxLen)
+		buf, _, err := fs.CreateMessage(time.Now(), nil, maxLen)
 		if err != nil {
 			t.Fatalf("Unable to create message: %v", err)
 		}
@@ -144,7 +144,7 @@ func sendPktsAndCollectReplies(ctx context.Context, t *testing.T, srvPort int, i
 	return rxSeq
 }
 
-func runProbe(ctx context.Context, t *testing.T, inp *inputState) ([]int, chan probeutils.ProbeResult, *probeRunResult, probeErr) {
+func runProbe(ctx context.Context, t *testing.T, inp *inputState) ([]int, chan statskeeper.ProbeResult, *probeRunResult, probeErr) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -177,8 +177,8 @@ func runProbe(ctx context.Context, t *testing.T, inp *inputState) ([]int, chan p
 	}
 	port := p.conn.LocalAddr().(*net.UDPAddr).Port
 
-	p.targets = p.opts.Targets.List()
-	resultsChan := make(chan probeutils.ProbeResult, 10)
+	p.updateTargets()
+	resultsChan := make(chan statskeeper.ProbeResult, 10)
 	go p.probeLoop(ctx, resultsChan)
 	time.Sleep(interval) // Wait for echo loop to be active.
 
@@ -320,7 +320,7 @@ func TestResultsChan(t *testing.T) {
 	}
 	_, resChan, _, _ := runProbe(ctx, t, inp)
 
-	var res []probeutils.ProbeResult
+	var res []statskeeper.ProbeResult
 readResChan:
 	for {
 		select {

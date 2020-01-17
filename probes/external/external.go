@@ -40,10 +40,12 @@ import (
 	"github.com/golang/protobuf/proto"
 	"github.com/google/cloudprober/logger"
 	"github.com/google/cloudprober/metrics"
+	"github.com/google/cloudprober/metrics/payload"
 	configpb "github.com/google/cloudprober/probes/external/proto"
 	serverpb "github.com/google/cloudprober/probes/external/proto"
 	"github.com/google/cloudprober/probes/external/serverutils"
 	"github.com/google/cloudprober/probes/options"
+	"github.com/google/cloudprober/targets/endpoint"
 	"github.com/google/cloudprober/validators"
 )
 
@@ -87,13 +89,13 @@ type Probe struct {
 	cmdStdout  io.ReadCloser
 	cmdStderr  io.ReadCloser
 	replyChan  chan *serverpb.ProbeReply
-	targets    []string
+	targets    []endpoint.Endpoint
 	results    map[string]*result // probe results keyed by targets
 	dataChan   chan *metrics.EventMetrics
 
 	// default payload metrics that we clone from to build per-target payload
 	// metrics.
-	defaultPayloadMetrics *metrics.EventMetrics
+	payloadParser *payload.Parser
 }
 
 // Init initializes the probe with the given params.
@@ -136,12 +138,27 @@ func (p *Probe) Init(name string, opts *options.Options) error {
 	case configpb.ProbeConf_SERVER:
 		p.mode = "server"
 	default:
-		p.l.Errorf("Invalid mode: %s", p.c.GetMode())
+		return fmt.Errorf("invalid mode: %s", p.c.GetMode())
 	}
 
 	p.results = make(map[string]*result)
 
-	return p.initPayloadMetrics()
+	if !p.c.GetOutputAsMetrics() {
+		return nil
+	}
+
+	defaultKind := metrics.CUMULATIVE
+	if p.c.GetMode() == configpb.ProbeConf_ONCE {
+		defaultKind = metrics.GAUGE
+	}
+
+	var err error
+	p.payloadParser, err = payload.NewParser(p.c.GetOutputMetricsOptions(), "external", p.name, metrics.Kind(defaultKind), p.l)
+	if err != nil {
+		return fmt.Errorf("error initializing payload metrics: %v", err)
+	}
+
+	return nil
 }
 
 // substituteLabels replaces occurrences of @label@ with the values from
@@ -280,13 +297,23 @@ func (p *Probe) readProbeReplies(done chan struct{}) error {
 }
 
 func (p *Probe) defaultMetrics(target string, result *result) *metrics.EventMetrics {
-	return metrics.NewEventMetrics(time.Now()).
+	em := metrics.NewEventMetrics(time.Now()).
 		AddMetric("success", metrics.NewInt(result.success)).
 		AddMetric("total", metrics.NewInt(result.total)).
 		AddMetric("latency", result.latency).
 		AddLabel("ptype", "external").
 		AddLabel("probe", p.name).
 		AddLabel("dst", target)
+
+	for _, al := range p.opts.AdditionalLabels {
+		em.AddLabel(al.KeyValueForTarget(target))
+	}
+
+	if p.opts.Validators != nil {
+		em.AddMetric("validation_failure", result.validationFailure)
+	}
+
+	return em
 }
 
 func (p *Probe) labels(target string) map[string]string {
@@ -345,7 +372,7 @@ type probeStatus struct {
 
 func (p *Probe) processProbeResult(ps *probeStatus, result *result) {
 	if ps.success && p.opts.Validators != nil {
-		failedValidations := validators.RunValidators(p.opts.Validators, nil, []byte(ps.payload), result.validationFailure, p.l)
+		failedValidations := validators.RunValidators(p.opts.Validators, &validators.Input{ResponseBody: []byte(ps.payload)}, result.validationFailure, p.l)
 
 		// If any validation failed, log and set success to false.
 		if len(failedValidations) > 0 {
@@ -366,9 +393,9 @@ func (p *Probe) processProbeResult(ps *probeStatus, result *result) {
 	// If probe is configured to use the external process output (or reply payload
 	// in case of server probe) as metrics.
 	if p.c.GetOutputAsMetrics() {
-		em := p.payloadToMetrics(ps.target, ps.payload, result)
-		p.opts.LogMetrics(em)
-		p.dataChan <- em
+		result.payloadMetrics = p.payloadParser.PayloadMetrics(result.payloadMetrics, ps.payload, ps.target)
+		p.opts.LogMetrics(result.payloadMetrics)
+		p.dataChan <- result.payloadMetrics
 	}
 }
 
@@ -433,14 +460,14 @@ func (p *Probe) runServerProbe(ctx context.Context) {
 	// Send probe requests
 	for _, target := range p.targets {
 		p.requestID++
-		p.results[target].total++
+		p.results[target.Name].total++
 		requestsMu.Lock()
 		requests[p.requestID] = requestInfo{
-			target:    target,
+			target:    target.Name,
 			timestamp: time.Now(),
 		}
 		requestsMu.Unlock()
-		p.sendRequest(p.requestID, target)
+		p.sendRequest(p.requestID, target.Name)
 		time.Sleep(TimeBetweenRequests)
 	}
 
@@ -462,11 +489,11 @@ func (p *Probe) runOnceProbe(ctx context.Context) {
 
 	for _, target := range p.targets {
 		wg.Add(1)
-		go func(target string, result *result) {
+		go func(target endpoint.Endpoint, result *result) {
 			defer wg.Done()
 			args := make([]string, len(p.cmdArgs))
 			for i, arg := range p.cmdArgs {
-				res, found := substituteLabels(arg, p.labels(target))
+				res, found := substituteLabels(arg, p.labels(target.Name))
 				if !found {
 					p.l.Warningf("Substitution not found in %q", arg)
 				}
@@ -489,36 +516,38 @@ func (p *Probe) runOnceProbe(ctx context.Context) {
 			}
 
 			p.processProbeResult(&probeStatus{
-				target:  target,
+				target:  target.Name,
 				success: success,
 				latency: time.Since(startTime),
 				payload: string(b),
 			}, result)
-		}(target, p.results[target])
+		}(target, p.results[target.Name])
 	}
 	wg.Wait()
 }
 
 func (p *Probe) updateTargets() {
-	p.targets = p.opts.Targets.List()
+	p.targets = p.opts.Targets.ListEndpoints()
 
-	for _, t := range p.targets {
-		if _, ok := p.results[t]; ok {
+	for _, target := range p.targets {
+		if _, ok := p.results[target.Name]; ok {
 			continue
 		}
+
 		var latencyValue metrics.Value
 		if p.opts.LatencyDist != nil {
 			latencyValue = p.opts.LatencyDist.Clone()
 		} else {
 			latencyValue = metrics.NewFloat(0)
 		}
-		p.results[t] = &result{
-			latency: latencyValue,
+
+		p.results[target.Name] = &result{
+			latency:           latencyValue,
+			validationFailure: validators.ValidationFailureMap(p.opts.Validators),
 		}
-		if p.c.GetOutputMetricsOptions().GetAggregateInCloudprober() {
-			// If we are aggregating in Cloudprober, we maintain an EventMetrics
-			// struct per-target.
-			p.results[t].payloadMetrics = p.defaultPayloadMetrics.Clone().AddLabel("dst", t)
+
+		for _, al := range p.opts.AdditionalLabels {
+			al.UpdateForTarget(target.Name, target.Labels)
 		}
 	}
 }

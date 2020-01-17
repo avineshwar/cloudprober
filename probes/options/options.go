@@ -73,7 +73,7 @@ type Options struct {
 	ProbeConf           interface{} // Probe-type specific config
 	LatencyDist         *metrics.Distribution
 	LatencyUnit         time.Duration
-	Validators          []*validators.ValidatorWithName
+	Validators          []*validators.Validator
 	SourceIP            net.IP
 	IPVersion           int
 	StatsExportInterval time.Duration
@@ -231,4 +231,23 @@ func (opts *Options) parseAdditionalLabels(p *configpb.ProbeDef) {
 
 		opts.AdditionalLabels = append(opts.AdditionalLabels, al)
 	}
+}
+
+// DefaultOptions returns default options, capturing default values for the
+// various fields.
+func DefaultOptions() *Options {
+	p := &configpb.ProbeDef{
+		Targets: &targetspb.TargetsDef{
+			Type: &targetspb.TargetsDef_DummyTargets{},
+		},
+	}
+
+	opts, err := BuildProbeOptions(p, nil, nil, nil)
+	// Without no user input, there should be no errors. We execute this as part
+	// of the tests.
+	if err != nil {
+		panic(err)
+	}
+
+	return opts
 }
